@@ -3,7 +3,7 @@ project:
   output-dir: docs
 
 website:
-  title: "COD"
+  title: "Concesión Onerosa de Derechos por Mayor Edificabilidad"
   navbar:
     left:
       - href: index.qmd
