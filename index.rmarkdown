@@ -1,0 +1,650 @@
+---
+title: "Concesión Onerosa de Derechos por Mayor Edificabilidad"
+---
+
+
+
+
+#### Tratamientos urbanísticos
+
+
+
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+
+paquetes = c('tidyverse','openxlsx','readxl','stringi','gtsummary', 'flextable', 
+             'leaflet', 'jsonlite', 'gglorenz', 'fastcluster', 'cluster', 'fuzzyjoin',
+             'sf',  'janitor', 'purrr')
+
+
+invisible(capture.output(lapply(paquetes, library, character.only = T)))
+
+
+# Limpieza datos ---------------------------------------------
+
+# lotes pugs 2024
+
+gdb_path <- "https://zenodo.org/records/13830812/files/lotes_sf.geojson?download=1"
+
+invisible(capture.output(lotes <- st_read(gdb_path)))
+
+# Selecciona las columnas que no contienen geometría
+lotes_sin_geom <- lotes %>%
+  select(-geometry) %>%
+  mutate(across(everything(), ~ gsub("[áÁ]", "a", .))) %>%
+  mutate(across(everything(), ~ gsub("[éÉ]", "e", .))) %>%
+  mutate(across(everything(), ~ gsub("[íÍ]", "i", .))) %>%
+  mutate(across(everything(), ~ gsub("[óÓ]", "o", .))) %>%
+  mutate(across(everything(), ~ gsub("[úÚ]", "u", .)))
+
+# Añadir nuevamente la columna de geometría y convertir a objeto sf
+lotes <- bind_cols(lotes_sin_geom, lotes %>% select(geometry)) %>%
+  st_as_sf()
+
+rm(lotes_sin_geom)
+
+# Variables ------
+
+lotes <- lotes %>% 
+  mutate_at(vars(VALORACI_1, AREA_TERRE, cos_pb_ba, pisos_ba, pisos_gm, CAT_AIVA_VALOR), as.numeric) 
+
+
+
+# Muestra para clusters (muy pesado directamente) --------------------
+
+
+# Parámetros de la fórmula
+N <- nrow(lotes) # Tamaño de la población
+Z <- 1.96    # Nivel de confianza del 95%
+p <- 0.5     # Proporción estimada de la población
+e <- 0.03    # Margen de error (3%)
+
+# Calcular el tamaño de la muestra
+n <- (N * Z^2 * p * (1 - p)) / (e^2 * (N - 1) + Z^2 * p * (1 - p))
+n <- ceiling(n)  # Redondear hacia arriba
+n <- n + 500
+
+
+
+# Clustering Jerárquico -------------
+
+set.seed(123)  # Asegurar reproducibilidad
+sample_size <- n  # Tamaño de muestra mayor al representativo
+lotes_sample <- lotes[sample(1:nrow(lotes), sample_size), ]
+
+# Realizar el clustering jerárquico en la muestra
+aivas_values_sample <- lotes_sample$CAT_AIVA_VALOR
+aivas_scaled_sample <- scale(aivas_values_sample)
+
+hc_sample <- fastcluster::hclust(dist(aivas_scaled_sample), method = "ward.D2")
+
+# Definir el número de clusters
+k <- 7  # Por ejemplo, 7 clusters
+clusters <- cutree(hc_sample, k = k)
+
+# Asignar los clusters a la muestra
+lotes_sample$cluster_hc <- clusters
+
+
+# Calcular los valores mínimos y máximos de CAT_AIVA_V por cluster
+cluster_ranges <- lotes_sample %>%
+  group_by(cluster_hc) %>%
+  summarise(
+    min_CAT_AIVA_V = min(CAT_AIVA_VALOR, na.rm = TRUE),
+    max_CAT_AIVA_V = max(CAT_AIVA_VALOR, na.rm = TRUE)
+  )
+
+# Ordenar los clusters por los valores mínimos de CAT_AIVA_V
+cluster_ranges <- cluster_ranges %>%
+  arrange(min_CAT_AIVA_V) %>%
+  mutate(new_cluster_hc = row_number()) 
+
+# Realizar el join condicional basado en los valores de CAT_AIVA_VALOR y los rangos de cluster_ranges
+lotes <- fuzzy_left_join(
+  lotes,
+  cluster_ranges,
+  by = c("CAT_AIVA_VALOR" = "min_CAT_AIVA_V", "CAT_AIVA_VALOR" = "max_CAT_AIVA_V"),
+  match_fun = list(`>=`, `<=`)
+)
+
+Beta <- c(0.2, 0.25, 0.30, 0.35, 0.40, 0.45, 0.5)
+
+# Asignar los valores de Beta en función de los clusters
+lotes <- lotes %>%
+  mutate(Beta = case_when(
+    new_cluster_hc == 1 ~ Beta[1],
+    new_cluster_hc == 2 ~ Beta[2],
+    new_cluster_hc == 3 ~ Beta[3],
+    new_cluster_hc == 4 ~ Beta[4],
+    new_cluster_hc == 5 ~ Beta[5],
+    new_cluster_hc == 6 ~ Beta[6],
+    new_cluster_hc == 7 ~ Beta[7]
+  ))
+
+
+# Crear la matriz de coeficientes de tratamiento base
+coef_tratamiento_base <- matrix(c(
+  # Parroquias urbanas, Parroquias rurales (tratamiento general o base)
+  1,   1.5,  # Potenciación
+  0.75, 1.5,  # Sostenimiento
+  0.5, 1.5,  # Renovación
+  0.5, 1.5,  # Mejoramiento integral
+  0.5, 1.5,  # Mejoramiento gradual
+  0.5, 1.5,  # Desarrollo
+  0.5, 1.5,  # Consolidación
+  0.5, 1.5,  # Conservación
+  0.5, 1.5   # Protección urbanística
+), nrow = 9, byrow = TRUE)
+
+# Asignar nombres a las filas y columnas
+rownames(coef_tratamiento_base) <- c("Potenciacion", "Sostenimiento", "Renovacion", "Mejoramiento integral", 
+                                     "Mejoramiento gradual", "Desarrollo", "Consolidacion", "Conservacion",
+                                     "Proteccion urbanistica")
+colnames(coef_tratamiento_base) <- c("Urbano", "Rural")
+
+# Crear la matriz de coeficientes del componente estructural
+coef_componente_estructural <- matrix(c(
+  # Parroquias urbanas, Parroquias rurales (componente estructural)
+  2, 2,     # Potenciación - Consolidado alto
+  1, 1.5,   # Potenciación - Consolidado medio
+  0.5, 0.5, # Potenciación - Consolidado bajo
+  1.5, 1.5, # Sostenimiento - Consolidado alto
+  1, 1,     # Sostenimiento - Consolidado medio
+  0.5, 0.5, # Sostenimiento - Consolidado bajo
+  1, 1,     # Renovación - Consolidado alto
+  0.5, 0.5, # Renovación - Consolidado medio
+  0.25, 0.25, # Renovación - Consolidado bajo
+  0.5, 1.5, # Mejoramiento integral - No consolidado
+  1, 1,     # Mejoramiento gradual - Consolidado medio
+  0.5, 0.5, # Mejoramiento gradual - Consolidado bajo
+  0.5, 1.5, # Desarrollo - No consolidado
+  0.5, 1.5, # Consolidación - No consolidado
+  1, 1,     # Conservación - Consolidado medio
+  0.5, 1.5, # Conservación - Consolidado alto
+  1.5, 1.5, # Protección urbanística - Consolidado alto
+  1, 1      # Protección urbanística - Consolidado medio
+), nrow = 18, byrow = TRUE)
+
+# Asignar nombres a las filas y columnas
+rownames(coef_componente_estructural) <- c(
+  "Potenciacion - Consolidado alto", "Potenciacion - Consolidado medio", "Potenciacion - Consolidado bajo", 
+  "Sostenimiento - Consolidado alto", "Sostenimiento - Consolidado medio", "Sostenimiento - Consolidado bajo", 
+  "Renovacion - Consolidado alto", "Renovacion - Consolidado medio", "Renovacion - Consolidado bajo", 
+  "Mejoramiento integral - No consolidado", "Mejoramiento gradual - Consolidado medio", "Mejoramiento gradual - Consolidado bajo",
+  "Desarrollo - No consolidado", "Consolidacion - No consolidado", 
+  "Conservacion - Consolidado medio", "Conservacion - Consolidado alto",
+  "Proteccion urbanistica - Consolidado alto", "Proteccion urbanistica - Consolidado medio"
+)
+colnames(coef_componente_estructural) <- c("Urbano", "Rural")
+
+
+
+# Función para asignar coeficientes de tratamiento base y componente estructural
+asignar_coeficientes <- function(clasifica, tratamient, subclasif) {
+  
+
+  # Determinar el coeficiente de tratamiento base
+  if (clasifica == "Urbano") {
+    coef_tratamiento <- coef_tratamiento_base[tratamient, "Urbano"]
+  } else if (clasifica == "Rural") {
+    coef_tratamiento <- coef_tratamiento_base[tratamient, "Rural"]
+  }
+  
+  # Determinar el coeficiente del componente estructural
+  fila_estructura <- paste(tratamient, "-", subclasif)
+  if (clasifica == "Urbano") {
+    coef_estructura <- coef_componente_estructural[fila_estructura, "Urbano"]
+  } else if (clasifica == "Rural") {
+    coef_estructura <- coef_componente_estructural[fila_estructura, "Rural"]
+  }
+  
+  # Devolver ambos coeficientes como lista
+  return(list(Coef_tratamiento = coef_tratamiento, Coef_componente_estructural = coef_estructura))
+}
+
+
+invisible(capture.output({
+lotes <- lotes %>%
+  mutate(coef_resultados = pmap(list(clasifica, tratamient, subclasif), asignar_coeficientes)) %>%
+  unnest_wider(coef_resultados)  
+}, file = 'NULL'))
+
+
+# Agregar factor de planeamiento (Fp) al dataset -------------
+
+
+# Agregar Fp al dataset -------------
+
+lotes <- lotes %>%
+  mutate(FP = Coef_tratamiento * Coef_componente_estructural)
+
+
+# Agregar Valor suelo = Valor predial de terreno / área del terreno
+
+
+lotes <- lotes %>%
+  filter(AREA_TERRE != 0)
+
+lotes <- lotes %>%
+  mutate(VS = VALORACI_1 / AREA_TERRE)
+
+# Agregar COS PB en m^2
+
+lotes <- lotes %>%
+  mutate(COS_PB = cos_pb_ba /100)
+
+lotes <- lotes %>%
+  mutate(COS_PB = AREA_TERRE * COS_PB)
+
+# asumiendo que va usar toda la edificabilidad máxima otorgada
+
+lotes <- lotes %>%
+  mutate(Max_Ae = pisos_gm - pisos_ba)
+
+
+# Agregar la nueva variable de porcentaje_AIVA según los rangos y porcentajes
+# lotes <- lotes %>%
+#   mutate(
+#     COD_AIVA_porcentaje = cut(CAT_AIVA_V, breaks = rangos_AIVAS, labels = porcentajes_AIVA_COD, right = FALSE)
+#   )
+
+
+# COD con la máxima área excedente otorgada
+
+lotes <- lotes %>%
+  mutate_at(vars(VS, COS_PB, Max_Ae, FP, Beta), as.numeric) %>%
+  mutate(
+    COD_max = ((VS * COS_PB * Max_Ae * FP) * Beta)
+  )
+
+# valor metro cuadrado con edificabilidad ba´sica
+
+lotes <- lotes %>%
+  mutate(Valor_m2 = VALORACI_1/(pisos_ba*COS_PB))
+
+# Mapaer FP y las zonas de edificabilidad doble --------------
+
+
+# Convertir el dataframe a un objeto sf
+lotes_sf <- st_as_sf(lotes, sf_column_name = "geometry...76.x")
+
+
+lotes_sf <- st_transform(lotes_sf, crs = 4326)
+
+
+### Mapa de tratamientos -------
+
+comentarios_tratamientos <- c(
+  "Potenciacion" = "Zonas consolidadas con potencial para desarrollarse",
+  "Sostenimiento" = "Alto grado de homogeneidad morfológica, no requiere intervención pública, sino normativa para mantener el equilibrio",
+  "Renovacion" = "Zonas que requieren renovación y rehabilitación de infraestructura",
+  "Conservacion" = "Áreas destinadas a la conservación del patrimonio natural y cultural",
+  "Consolidacion" = "Zonas con déficit de espacio público, infraestructura y equipamiento	 público	 que requieren ser mejoradas",
+  "Desarrollo" = "suelo	urbano que no	presenta procesos	previos	de urbanización	y que	debe	ser	transformado	para	su	articulación a la	estructura	urbana	existente",
+  "Mejoramiento gradual" = "Zonas que requieren intervenciones menores para su mejora",
+  "Mejoramiento integral" = "Áreas con necesidades significativas de mejora urbana",
+  "Proteccion urbanistica" = "Busca cualificar,	ordenar, mantener, abastecer estas zonas de protección con características urbanísticas y/o paisajísticas"
+)
+
+
+# Ordenar los niveles de la columna 'tratamient' en el mismo orden que los colores
+lotes_sf$tratamient <- factor(lotes_sf$tratamient, levels = c(
+  "Potenciacion", "Sostenimiento", "Renovacion","Conservacion", "Consolidacion", "Desarrollo", "Mejoramiento gradual",
+  "Mejoramiento integral",  "Proteccion urbanistica"
+  
+))
+
+# Definir los colores manuales para cada categoría del campo 'tratamient'
+colores_tratamientos <- c(
+  "Potenciacion" = "#e41a1c",  # Rojo fuerte
+  "Sostenimiento" = "#377eb8",  # Azul fuerte
+  "Renovacion" = "#4daf4a",  # Verde fuerte
+  "Conservacion" = "#999999",   # Gris fuerte
+  "Consolidacion" = "#f781bf",  # Rosa fuerte
+  "Desarrollo" = "#a65628",   # Marrón fuerte
+  "Mejoramiento gradual" = "#ff7f00",  # Naranja fuerte
+  "Mejoramiento integral" = "#984ea3",  # Morado fuerte
+  "Proteccion urbanistica" = "#00ffff"  # Amarillo fuerte
+  
+  
+)
+
+# Crear una paleta manual usando colorFactor
+pal <- colorFactor(
+  palette = colores_tratamientos,
+  domain = lotes_sf$tratamient
+)
+
+# Construir el mapa con los colores establecidos y los comentarios agregados
+tratamientos <- leaflet(lotes_sf) %>%
+  addTiles() %>%
+  setView(lng = -78.5, lat = -0.18, zoom = 13) %>%
+  addPolygons(
+    fillColor = ~pal(tratamient),  # Mantener los colores manuales
+    weight = 1,
+    opacity = 1,
+    color = "white",
+    dashArray = "3",
+    fillOpacity = 0.7,
+    highlight = highlightOptions(
+      weight = 5,
+      color = "#666",
+      dashArray = "",
+      fillOpacity = 0.7,
+      bringToFront = TRUE
+    ),
+    label = ~paste("", tratamient, ":", comentarios_tratamientos[tratamient]),  # Agregar comentarios
+    labelOptions = labelOptions(
+      style = list("font-weight" = "normal", padding = "3px 8px"),
+      textsize = "15px",
+      direction = "auto",
+      sticky = TRUE  # Mantener el tooltip mientras el cursor esté sobre el área
+    )
+  ) %>%
+  addLegend(
+    pal = pal,  # Usar la paleta manual para la leyenda
+    values = ~tratamient,
+    opacity = 0.7,
+    title = "Tratamientos Urbanísticos",
+    position = "bottomright"
+  )
+tratamientos
+
+```
+
+
+
+
+------------------------------------------------------------------------
+
+#### Factor de planeamiento en lotes con edificabilidad máxima
+
+
+
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+
+
+
+# Crear el mapa interactivo -----------
+
+
+mapa <- leaflet(lotes_sf) %>%
+  addTiles() %>%  # Capa base
+  setView(lng = -78.5, lat = -0.18, zoom = 13) %>%
+  addPolygons(
+    fillColor = ~colorNumeric("Spectral", FP)(FP),  # Color basado en el factor de planeamiento
+    weight = 1,
+    opacity = 1,
+    color = "white",
+    dashArray = "3",
+    fillOpacity = 0.7,
+    highlight = highlightOptions(
+      weight = 5,
+      color = "#666",
+      dashArray = "",
+      fillOpacity = 0.7,
+      bringToFront = TRUE
+    ),
+    label = ~paste("Factor de Planeamiento:", FP),
+    labelOptions = labelOptions(
+      style = list("font-weight" = "normal", padding = "3px 8px"),
+      textsize = "15px",
+      direction = "auto"
+    )
+  ) %>%
+  addLegend(pal = colorNumeric("Spectral", NULL), values = ~FP, opacity = 0.7,
+            title = "Factor de Planeamiento", position = "bottomright")
+
+
+mapa
+
+```
+
+
+
+
+------------------------------------------------------------------------
+
+##### Valor rangos AIVAS
+
+
+
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+
+library(tidyverse)
+
+# Filtrar filas donde 'new_cluster_hc' no sea NA
+lotes_sf <- lotes_sf %>%
+  filter(!is.na(new_cluster_hc))
+
+# Crear columna con el rango de AIVAS
+lotes_sf <- lotes_sf %>%
+  mutate(rango_aivas = paste0(round(min_CAT_AIVA_V,0)), " - ", round(max_CAT_AIVA_V,0))
+
+
+# Crear un vector con los rangos en formato texto para la leyenda
+rango_leyenda <- lotes_sf %>%
+  group_by(new_cluster_hc) %>%
+  summarise(rango_aivas = paste0(min(min_CAT_AIVA_V), " - ", max(max_CAT_AIVA_V))) %>%
+  pull(rango_aivas)
+
+
+# Definir la paleta de colores para los rangos de AIVAS
+colores_aivas <- colorFactor(
+  palette = "YlOrRd",  # Puedes cambiar la paleta si prefieres otros colores
+  domain = lotes_sf$new_cluster_hc  # La columna que contiene los rangos de AIVAS
+)
+
+# Crear el mapa con los rangos de AIVAS
+mapa_aivas <- leaflet(lotes_sf) %>%
+  addTiles() %>%  # Capa base
+  setView(lng = -78.5, lat = -0.18, zoom = 13) %>%
+  addPolygons(
+    fillColor = ~colores_aivas(new_cluster_hc),  # Asignar colores por cluster de AIVAS
+    weight = 1,
+    opacity = 1,
+    color = "white",
+    dashArray = "3",
+    fillOpacity = 0.7,
+    highlight = highlightOptions(
+      weight = 5,
+      color = "#666",
+      dashArray = "",
+      fillOpacity = 0.7,
+      bringToFront = TRUE
+    ),
+    label = ~paste("Rango AIVAS:", "$", rango_aivas),  # Mostrar el rango de AIVAS al pasar el mouse
+    labelOptions = labelOptions(
+      style = list("font-weight" = "normal", padding = "3px 8px"),
+      textsize = "15px",
+      direction = "auto"
+    )
+  ) %>%
+  addLegend(
+    position = "bottomright",
+    colors = colores_aivas(1:length(rango_leyenda)),  # Colores asociados a cada rango
+    labels = rango_leyenda,  # Nombres de los rangos
+    title =  paste("Rangos AIVAS [$/m", "²", "]"),
+    opacity = 0.7
+  )
+# Mostrar el mapa
+mapa_aivas
+
+
+```
+
+
+
+
+------------------------------------------------------------------------
+
+##### Valor del suelo por metro cuadrado usando la edificabilidad básica
+
+
+
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+
+
+# mapa valor por metro cuadrado ------
+
+# Crear categorías para valor_m2 con rangos fijos
+lotes_sf <- lotes_sf %>%
+  mutate(
+    valor_m2_redondeado = round(Valor_m2, 0),  # Redondear valor_m2 sin decimales
+    categoria_m2 = case_when(
+      valor_m2_redondeado >= 0 & valor_m2_redondeado <= 60 ~ "0 - 60",
+      valor_m2_redondeado >= 61 & valor_m2_redondeado <= 120 ~ "61 - 120",
+      valor_m2_redondeado >= 121 & valor_m2_redondeado <= 200 ~ "121 - 200",
+      valor_m2_redondeado >= 201 & valor_m2_redondeado <= 300 ~ "201 - 300",
+      valor_m2_redondeado >= 301 & valor_m2_redondeado <= 400 ~ "301 - 400",
+      valor_m2_redondeado >= 401 ~ "401 en adelante",
+
+      TRUE ~ "Sin Datos"  # Por si hay valores NA o fuera de rango
+    )
+  )
+
+
+
+# Definir colores fijos por categoría
+colores_m2 <- c(
+  "0 - 60" = "#FFCCCC",   # Bajo
+  "61 - 120" = "#FF9999",     # Medio
+  "121 - 200" = "#FF6666",    # Alto
+  "201 - 300" = "#FF3333",       # Muy Alto
+  "301 - 400" = "#CC0000",
+  "401 en adelante" = "#990000"  # Muy Alto
+)
+
+# Asegurarse de que las categorías sigan el mismo orden
+lotes_sf$categoria_m2 <- factor(lotes_sf$categoria_m2, levels = c("0 - 60", "61 - 120", "121 - 200", "201 - 300", "301 - 400", "401 en adelante"))
+
+
+
+# Crear paleta manual basada en los niveles de categoria_m2
+pal <- colorFactor(
+  palette = colores_m2,
+   domain = lotes_sf$categoria_m2
+)
+
+# Crear el mapa con las categorías y colores fijos
+m2 <- leaflet(lotes_sf) %>%
+  addTiles() %>%
+  setView(lng = -78.5, lat = -0.18, zoom = 13) %>%
+  addPolygons(
+    fillColor = ~pal(categoria_m2),
+    weight = 1,
+    opacity = 1,
+    color = "white",
+    dashArray = "3",
+    fillOpacity = 0.7,
+    highlight = highlightOptions(
+      weight = 5,
+      color = "#666",
+      dashArray = "",
+      fillOpacity = 0.7,
+      bringToFront = TRUE
+    ),
+    label = ~paste("$", round(valor_m2_redondeado, 0), ";", "Categoría:", categoria_m2),
+    labelOptions = labelOptions(
+      style = list("font-weight" = "normal", padding = "3px 8px"),
+      textsize = "15px",
+      direction = "auto"
+    )
+  ) %>%
+  addLegend(
+    position = "bottomright",
+    title = paste("Valor del suelo [$/m", "²", "]"),  
+    opacity = 0.7,
+    pal = pal,
+    values = ~categoria_m2,
+    labels = levels(lotes_sf$categoria_m2)   
+  )
+
+# Mostrar el mapa
+m2
+```
+
+
+
+
+------------------------------------------------------------------------
+
+#### Valor metro cuadrado propuesto
+
+
+
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+#| eval: false
+
+# Define 7 fixed intervals for your bins (adjust based on your data)
+fixed_bins <- c(0, 120, 300, 600, 1000, 1500, 2000, 2500)  
+
+# Create the color palette using the fixed bins
+pal <- colorBin(
+  palette = "Reds",            # Use the "Reds" color palette
+  domain = lotes_sf$VS,        # The data to base the coloring on
+  bins = fixed_bins,           # Use 7 fixed bins
+  na.color = "transparent"     # Handle NA values
+)
+
+# Crear el mapa con las categorías y colores fijos
+valor_m2 <- leaflet(lotes_sf) %>%
+  addTiles() %>%
+  setView(lng = -78.5, lat = -0.18, zoom = 13) %>%
+  addPolygons(
+    fillColor = ~pal(VS),
+    weight = 1,
+    opacity = 1,
+    color = "white",
+    dashArray = "3",
+    fillOpacity = 0.7,
+    highlight = highlightOptions(
+      weight = 5,
+      color = "#666",
+      dashArray = "",
+      fillOpacity = 0.7,
+      bringToFront = TRUE
+    ),
+    label = ~paste("$", round(VS, 0)),
+    labelOptions = labelOptions(
+      style = list("font-weight" = "normal", padding = "3px 8px"),
+      textsize = "15px",
+      direction = "auto"
+    )
+  ) %>%
+  addLegend(
+    position = "bottomright",
+    title = paste("Valor del suelo [$/m", "²", "]"),  
+    opacity = 0.7,
+    pal = pal,
+    values = ~VS
+    )
+
+# Mostrar el mapa
+valor_m2
+
+```
+

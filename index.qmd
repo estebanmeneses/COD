@@ -1,7 +1,6 @@
 ---
-title: "Concesión Onerosa de Derechos por Mayor Edificabilidad"
+title: "COD"
 ---
-
 
 #### Tratamientos urbanísticos
 
@@ -570,12 +569,15 @@ m2
 #| message: false
 #| eval: false
 
-# Create the color palette with six bins using a red scale
+# Define 7 fixed intervals for your bins (adjust based on your data)
+fixed_bins <- c(0, 120, 300, 600, 1000, 1500, 2000, 2500)  
+
+# Create the color palette using the fixed bins
 pal <- colorBin(
-  palette = "Reds",     # Use the "Reds" color palette
-  domain = lotes_sf$VS,    # The data to base the coloring on
-  bins = 6,             # Create 6 bins
-  na.color = "transparent"  # Handle NA values
+  palette = "Reds",            # Use the "Reds" color palette
+  domain = lotes_sf$VS,        # The data to base the coloring on
+  bins = fixed_bins,           # Use 7 fixed bins
+  na.color = "transparent"     # Handle NA values
 )
 
 # Crear el mapa con las categorías y colores fijos
