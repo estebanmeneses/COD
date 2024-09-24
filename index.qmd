@@ -561,13 +561,13 @@ m2
 
 ------------------------------------------------------------------------
 
-#### Valor metro cuadrado propuesto
+#### Valor por metro cuadrado propuesto
 
 ```{r}
 #| echo: false
 #| warning: false
 #| message: false
-#| eval: false
+#| eval: true
 
 # Define 7 fixed intervals for your bins (adjust based on your data)
 fixed_bins <- c(0, 120, 300, 600, 1000, 1500, 2000, 2500)  
