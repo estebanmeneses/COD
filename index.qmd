@@ -10,8 +10,8 @@ title: "COD"
 #| message: false
 
 
-paquetes = c('tidyverse','openxlsx','readxl','stringi','gtsummary', 'flextable', 
-             'leaflet', 'jsonlite', 'gglorenz', 'fastcluster', 'cluster', 'fuzzyjoin',
+paquetes = c('tidyverse','openxlsx','readxl','stringi', 
+             'leaflet', 'jsonlite', 'fastcluster', 'cluster', 'fuzzyjoin',
              'sf',  'janitor', 'purrr')
 
 
